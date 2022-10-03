@@ -13,11 +13,27 @@
 #define DEV_NAME	"ttyS"
 #define UART_NR		3
 
-#define UART_FIFO_REG	0x00
-#define UART_STATUS_REG		0x1c
-#define UART_TXFIFO_CNT_MASK		0x00ff0000
-#define UART_TXFIFO_CNT_SHIFT		16
+#define UART_FIFO_REG			0x00
+#define UART_STATUS_REG			0x1c
+#define UART_MEM_CNT_STATUS_REG		0x64
 
+#define DPORT_PRO_INTR_STATUS_REG_1_REG
+
+
+// get tx fifo character count from status register
+#define UART_TXFIFO_STATUS_MASK		0x00ff0000
+#define UART_TXFIFO_STATUS_SHIFT	16
+#define UART_TXFIFO_CNT_MASK		0x00000038
+#define UART_TXFIFO_CNT_SHIFT		5
+
+// get tx fifo character count
+#define UART_RXFIFO_STATUS_MASK		0x000000ff
+#define UART_RXFIFO_STATUS_SHIFT	0
+#define UART_RXFIFO_CNT_MASK		0x00000007
+#define UART_RXFIFO_CNT_SHIFT		8
+
+#define USE_TIMER 1
+#define USE_IRQ 0
 
 static const struct of_device_id esp32_dt_ids[] = {
 	{
@@ -27,34 +43,16 @@ static const struct of_device_id esp32_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, esp32_dt_ids);
 
-static struct uart_port *esp32_ports[UART_NR];
+struct esp32uart_port {
+	struct uart_port port;
+	struct timer_list timer;
+	u32 id;
+};
+
+static struct esp32uart_port *esp32_ports[UART_NR];
 static struct uart_port *earlycon_port;
 
-void dbg_echo(const char *s)
-{
-	volatile void __iomem *base = (volatile void __iomem *)0x3ff40000;
-
-	while ((readl(base + UART_STATUS_REG) & UART_TXFIFO_CNT_MASK) != 0)
-		;
-
-	while (*s) {
-		if (*s == '\n')
-			writel('\r', base + UART_FIFO_REG);
-		writel(*s, base + UART_FIFO_REG);
-		++s;
-	}
-}
-
-void dbg_printf(const char *fmt, ...)
-{
-	va_list ap;
-	char buf[256];
-
-	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-	dbg_echo(buf);
-}
+#define to_esp32uart_port(port)	container_of(port, struct esp32uart_port, port)
 
 /* configure/auto-configure the port */
 static void esp32_config_port(struct uart_port *port, int flags)
@@ -72,8 +70,89 @@ static unsigned int esp32_get_mctrl(struct uart_port *port)
 	return 0;
 }
 
+static unsigned int esp32_rx_fifo_cnt(struct uart_port *port)
+{
+	uint32_t status_reg = readl(port->membase + UART_STATUS_REG);
+	uint32_t mem_cnt_reg = readl(port->membase + UART_MEM_CNT_STATUS_REG);
+	return ((mem_cnt_reg & UART_RXFIFO_CNT_MASK) << UART_RXFIFO_CNT_SHIFT) |
+		((status_reg & UART_RXFIFO_STATUS_MASK) >> UART_RXFIFO_STATUS_SHIFT);
+}
+
+static void read_characters_and_flip(struct uart_port *port)
+{
+	struct tty_port *tport = &port->state->port;
+	int i;
+
+	// read characters while there are characters available
+	for (i=0; esp32_rx_fifo_cnt(port); i++) {
+		// read single character from the fifo(RX)
+		int ch = readl(port->membase + UART_FIFO_REG) & 0xff;
+		tty_insert_flip_char(tport, ch, TTY_NORMAL);
+	}
+
+	// push the buffer if at least one character was received
+	if (i>0)
+		tty_flip_buffer_push(&port->state->port);
+}
+
+#if USE_TIMER
+static void esp32_timer(struct timer_list *t)
+{
+	// This implementation is a hack! It should really use interrupts...
+	struct esp32uart_port *uart = from_timer(uart, t, timer);
+	struct uart_port *port = &uart->port;
+
+	read_characters_and_flip(port);
+
+	// restart the timer
+	mod_timer(&uart->timer, jiffies + uart_poll_timeout(port));
+	//mod_timer(&uart->timer, jiffies + 1);
+}
+#endif
+
+#if USE_IRQ
+static irqreturn_t esp32_uart_interrupt(int irq, void *dev_id)
+{
+	struct esp32uart_port *uart = dev_id;
+	struct uart_port *port = &uart->port;
+
+	pr_info("\nXXX UART INTERRUPT\n");
+
+	//spin_lock(&port->lock);
+
+	read_characters_and_flip(port);
+
+	//spin_unlock(&port->lock);
+
+	return IRQ_HANDLED;
+}
+#endif
+
 static int esp32_startup(struct uart_port *port)
 {
+	struct esp32uart_port *uart = to_esp32uart_port(port);
+
+#if USE_IRQ
+	int retval;
+
+	/* Allocate the IRQ */
+	pr_info("Trying to get IRQ: %d", port->irq);
+	retval = request_irq(port->irq, esp32_uart_interrupt, 0, "esp32_uart", uart);
+	if (retval)
+		return retval;
+#endif
+
+
+#if USE_TIMER
+
+
+	timer_setup(&uart->timer, esp32_timer, 0);
+	mod_timer(&uart->timer, jiffies + uart_poll_timeout(port));
+	//mod_timer(&uart->timer, jiffies + 1);
+#endif
+
+	//spin_lock_init(&port->lock);
+
 	return 0;
 }
 
@@ -111,8 +190,12 @@ static void esp32_stop_rx(struct uart_port *port)
 
 static unsigned int esp32_tx_fifo_cnt(struct uart_port *port)
 {
-	return (readl(port->membase + UART_STATUS_REG) &
-		UART_TXFIFO_CNT_MASK) >> UART_TXFIFO_CNT_SHIFT;
+	uint32_t status_reg, mem_cnt_reg;
+
+	status_reg = readl(port->membase + UART_STATUS_REG);
+	mem_cnt_reg = readl(port->membase + UART_MEM_CNT_STATUS_REG);
+	return ((mem_cnt_reg & UART_TXFIFO_CNT_MASK) << UART_TXFIFO_CNT_SHIFT) |
+		((status_reg & UART_TXFIFO_STATUS_MASK) >> UART_TXFIFO_STATUS_SHIFT);
 }
 
 /* return TIOCSER_TEMT when transmitter is not busy */
@@ -194,7 +277,8 @@ static void esp32_string_write(struct uart_port *sport, const char *s,
 static void
 esp32_console_write(struct console *co, const char *s, unsigned int count)
 {
-	struct uart_port *sport = esp32_ports[co->index];
+	struct esp32uart_port *eport = esp32_ports[co->index];
+	struct uart_port *sport = &eport->port;
 	unsigned long flags;
 	int locked = 1;
 
@@ -213,6 +297,7 @@ esp32_console_write(struct console *co, const char *s, unsigned int count)
 
 static int __init esp32_console_setup(struct console *co, char *options)
 {
+	struct esp32uart_port *eport;
 	struct uart_port *sport;
 	int baud = 115200;
 	int bits = 8;
@@ -227,9 +312,12 @@ static int __init esp32_console_setup(struct console *co, char *options)
 	if (co->index == -1 || co->index >= ARRAY_SIZE(esp32_ports))
 		co->index = 0;
 
-	sport = esp32_ports[co->index];
-	if (!sport)
+	eport = esp32_ports[co->index];
+
+	if (!eport)
 		return -ENODEV;
+
+	sport = &eport->port;
 
 	if (options)
 		uart_parse_options(options, &baud, &parity, &bits, &flow);
@@ -289,13 +377,16 @@ static struct uart_driver esp32_reg = {
 static int esp32_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
-	struct uart_port *sport;
+	struct esp32uart_port *uart;
+	struct uart_port *port;
 	struct resource *res;
 	int ret;
 
-	sport = devm_kzalloc(&pdev->dev, sizeof(*sport), GFP_KERNEL);
-	if (!sport)
+	uart = devm_kzalloc(&pdev->dev, sizeof(*uart), GFP_KERNEL);
+	if (!uart)
 		return -ENOMEM;
+
+	port = &uart->port;
 
 	ret = of_alias_get_id(np, "serial");
 	if (ret < 0) {
@@ -308,41 +399,45 @@ static int esp32_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	sport->line = ret;
+	port->line = ret;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		return -ENODEV;
 	}
 
-	sport->mapbase = res->start;
-	sport->membase = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(sport->membase)) {
-		return PTR_ERR(sport->membase);
+	port->mapbase = res->start;
+	port->membase = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(port->membase)) {
+		return PTR_ERR(port->membase);
 	}
 
-	sport->dev = &pdev->dev;
-	sport->type = PORT_ESP32UART;
-	sport->iotype = UPIO_MEM;
-	sport->irq = platform_get_irq(pdev, 0);
-	sport->ops = &esp32_pops;
-	sport->flags = UPF_BOOT_AUTOCONF;
+	port->dev = &pdev->dev;
+	port->type = PORT_ESP32UART;
+	port->iotype = UPIO_MEM;
+	port->irq = platform_get_irq(pdev, 0);
+	port->ops = &esp32_pops;
+	port->flags = UPF_BOOT_AUTOCONF;
 
-	esp32_ports[sport->line] = sport;
+	esp32_ports[port->line] = uart;
 
-	platform_set_drvdata(pdev, sport);
+	platform_set_drvdata(pdev, uart);
 
-	ret = uart_add_one_port(&esp32_reg, sport);
+	ret = uart_add_one_port(&esp32_reg, port);
 	if (ret) {
 		return ret;
 	}
+
+	pr_info(KERN_INFO "esp32_uart at 0x%llx, irq %d\n",
+	       (unsigned long long) port->mapbase, port->irq);
 
 	return 0;
 }
 
 static int esp32_remove(struct platform_device *pdev)
 {
-	struct uart_port *sport = platform_get_drvdata(pdev);
+	struct esp32uart_port *eport = platform_get_drvdata(pdev);
+	struct uart_port *sport = &eport->port;
 
 	uart_remove_one_port(&esp32_reg, sport);
 
