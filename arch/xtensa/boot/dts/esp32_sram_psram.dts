@@ -7,15 +7,30 @@
 	#size-cells = <1>;
 	interrupt-parent = <&pic>;
 
-	chosen {
-		bootargs = "earlycon=esp32uart,mmio32,0x3ff40000,115200n8 console=ttyS0,115200n8 debug rw root=mtd:data init=/bin/sh ip=dhcp";
-	};
-
 	aliases {
 		serial0 = "/serial@3ff40000";
 	};
 
+	/* D SRAM2 200KB */
 	memory@0 {
+		device_type = "memory";
+		reg = <0x3ffae000 0x00032000>;
+	};
+
+	/* D SRAM1 128KB */
+	memory@1 {
+		device_type = "memory";
+		reg = <0x3ffe0000 0x00020000>;
+	};
+
+	/* I SRAM0 128KB */
+	memory@2 {
+		device_type = "memory";
+		reg = <0x40080000 0x00020000>;
+	};
+
+	/* PSRAM */
+	memory@3 {
 		device_type = "memory";
 		reg = <0x3f800000 0x00400000>;
 	};
