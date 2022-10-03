@@ -66,8 +66,12 @@ void platform_heartbeat(void)
 static void watchdog_cb(struct timer_list *timer)
 {
 	kick_watchdog();
+#ifdef XXX_ENABLE_TIMER_STUFF
 	mod_timer(timer, jiffies + HZ);
+#endif
 }
+
+#ifdef XXX_ENABLE_TIMER_STUFF
 
 static DEFINE_TIMER(watchdog_timer, watchdog_cb);
 
@@ -193,3 +197,6 @@ static int __init machine_setup(void)
 	return 0;
 }
 late_initcall(machine_setup);
+
+
+#endif
