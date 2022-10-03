@@ -803,7 +803,7 @@ static int load_flat_file(struct linux_binprm *bprm,
 					 * Meh, the same value can have a different
 					 * byte order based on a flag..
 					 */
-					addr = ntohl((__force __be32)addr);
+					//addr = ntohl((__force __be32)addr);
 				}
 				addr = calc_reloc(addr, libinfo);
 				if (addr == RELOC_FAILED) {
